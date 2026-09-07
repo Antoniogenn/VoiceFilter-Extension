@@ -1,4 +1,4 @@
-# VoiceFilter-Extension# Voice Live — estensione Firefox + backend Python
+# Voice Live — estensione Firefox + backend Python
 
 Rileva **in tempo reale chi sta parlando** in un video YouTube: la popup mostra
 le voci rilevate (`voce1`, `voce2`, ...) e per ognuna uno **slider 0–100%** per
