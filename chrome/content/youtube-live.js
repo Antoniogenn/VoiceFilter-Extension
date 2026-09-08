@@ -179,6 +179,11 @@ browser.runtime.onMessage.addListener((msg) => {
     status(`backend -> ${currentHost}`);
     if (active) startF();
   }
+  if (msg.type === "pin" || msg.type === "unpin") {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: msg.type, name: msg.name }));
+    }
+  }
   if (msg.type === "clear-voices") {
     lastVoices = null;
     lastNow = null;

@@ -7,11 +7,12 @@ const heartbeatSel = document.getElementById("heartbeat");
 const hostInput = document.getElementById("host");
 const logEl = document.getElementById("log");
 
-let detectedVoices = new Map();   // nome -> conteggio, mai rimossi
+let detectedVoices = new Map();   // nome -> conteggio, allineato al backend
 let levels = new Map();           // nome -> livello (0..1), default 1.0
 let current = null;               // voce rilevata al momento (nome backend)
 let displayNames = new Map();     // nome backend -> nome personalizzato
-const rows = new Map();           // nome backend -> { dot, lbl }
+let pinned = new Set();           // voci protette dalla rimozione automatica
+const rows = new Map();           // nome backend -> { dot, lbl, pin }
 
 function displayName(n) {
   return displayNames.get(n) || n;
@@ -28,6 +29,14 @@ function renderVoices() {
     const level = levels.has(n) ? levels.get(n) : 1.0;
     const row = document.createElement("div");
     row.className = "voice-row";
+    const pin = document.createElement("input");
+    pin.type = "checkbox";
+    pin.checked = pinned.has(n);
+    pin.title = "Proteggi: non eliminare questa voce";
+    pin.onchange = () => {
+      if (pin.checked) pinned.add(n); else pinned.delete(n);
+      sendAll(pin.checked ? "pin" : "unpin", { name: n });
+    };
     const dot = document.createElement("span");
     dot.className = "dot";
     const lbl = document.createElement("span");
@@ -74,11 +83,12 @@ function renderVoices() {
       sendAll("set-level", { name: n, level: v });
       browser.storage.local.set({ levels: Object.fromEntries(levels) });
     };
+    row.appendChild(pin);
     row.appendChild(dot);
     row.appendChild(lbl);
     row.appendChild(slider);
     row.appendChild(val);
-    rows.set(n, { dot, lbl });
+    rows.set(n, { dot, lbl, pin });
     voicesEl.appendChild(row);
   }
   markCurrent();
@@ -130,6 +140,7 @@ stopBtn.onclick = () => { send("stop"); startBtn.disabled = false; stopBtn.disab
 document.getElementById("clear").onclick = () => {
   detectedVoices.clear();
   current = null;
+  pinned.clear();
   browser.storage.local.remove(["levels", "displayNames"]);
   browser.storage.local.set({ levels: {}, displayNames: {} });
   sendAll("clear-voices");
@@ -169,7 +180,11 @@ browser.runtime.onMessage.addListener((msg) => {
     for (const n of [...detectedVoices.keys()]) {
       if (!names.has(n)) detectedVoices.delete(n);
     }
-    for (const v of list) detectedVoices.set(v.name, v.count || 1);
+    pinned.clear();
+    for (const v of list) {
+      detectedVoices.set(v.name, v.count || 1);
+      if (v.pinned) pinned.add(v.name);
+    }
     renderVoices();
   }
   if (msg.type === "state") {

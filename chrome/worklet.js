@@ -68,10 +68,18 @@ class VoiceLiveProcessor extends AudioWorkletProcessor {
 
     // pass-through con gain lisciato (livello per voce).
     // In sovrapposizione (due voci insieme nel mix) non e' possibile isolare
-    // una singola voce: l'audio resta a volume pieno.
+    // una singola voce: si applica il livello piu' basso tra quelli delle voci
+    // presenti, cosi' una voce da attenuare resta attenuata anche se il mix
+    // contiene un'altra voce.
     let level;
-    if (this.overlap) level = 1.0;
-    else level = (this.speaker && this.levels[this.speaker] != null) ? this.levels[this.speaker] : 1.0;
+    if (this.overlap) {
+      level = 1.0;
+      for (const s of this.overlap) {
+        if (this.levels[s] != null) level = Math.min(level, this.levels[s]);
+      }
+    } else {
+      level = (this.speaker && this.levels[this.speaker] != null) ? this.levels[this.speaker] : 1.0;
+    }
     const target = level * this.smooth;
     if (this.speaker && this.levels[this.speaker] != null && !this.overlap) {
       // voce rilevata: attenuazione istantanea

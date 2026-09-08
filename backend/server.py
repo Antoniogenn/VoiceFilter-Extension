@@ -55,6 +55,11 @@ OVERLAP_GAP = 0.15          # se top-1 e top-2 sono vicini -> le voci si sovrapp
 RESIDUAL_MIN = 0.40         # coseno del residuo (dopo la voce dominante) per la 2a voce
 RESIDUAL_NORM_MIN = 0.20    # modulo minimo del residuo per fidarsi della sua direzione
 
+# retention: le voci che non vengono rilevate da VOICE_TTL_S vengono rimosse dal
+# catalogo (gli ospiti che vanno via spariscono; chi torna dopo e' una nuova voce).
+VOICE_TTL_S = 300           # 5 min dall'ultimo intervento -> la voce viene cancellata
+PRUNE_INTERVAL_S = 5        # cadenza con cui il task di pulizia rileva le scadenze
+
 _encoder = None
 _encoder_device = "cpu"
 _vad = None
@@ -111,6 +116,7 @@ class SpeakerCatalog:
         v["count"] += 1
         v["embed"] = v["embed"] * (v["count"] - 1) / v["count"] + embed / v["count"]
         v["embed"] /= np.linalg.norm(v["embed"])
+        v["last_seen"] = time.monotonic()
 
     def residual_top(self, embed, exclude_label):
         """Direzione residua di `embed` dopo aver tolto la voce dominante.
@@ -136,10 +142,29 @@ class SpeakerCatalog:
         return best_label, best_cos, rn
 
     def add(self, embed):
-        num = len(self.by_label) + 1
+        nums = []
+        for lab in self.by_label:
+            try:
+                nums.append(int(lab[len("voce"):]))
+            except (ValueError, TypeError):
+                pass
+        num = (max(nums) + 1) if nums else 1
         label = f"voce{num}"
-        self.by_label[label] = {"embed": embed, "count": 1}
+        self.by_label[label] = {"embed": embed, "count": 1, "last_seen": time.monotonic()}
         return label
+
+    def prune(self, ttl, pinned=()):
+        """Rimuove le voci inattive da piu' di ttl secondi, tranne quelle protette.
+        Ritorna i nomi rimossi."""
+        pinned = set(pinned)
+        now = time.monotonic()
+        stale = [k for k, v in self.by_label.items()
+                 if k not in pinned
+                 and v.get("last_seen") is not None
+                 and now - v["last_seen"] > ttl]
+        for k in stale:
+            del self.by_label[k]
+        return stale
 
 
 class StreamSession:
@@ -156,6 +181,7 @@ class StreamSession:
         self.catalog = SpeakerCatalog()
         self.candidate = None            # {"embed", "hits"}
         self.voices = {}                 # label -> conteggio interventi emessi
+        self.pinned = set()              # label protette dalla rimozione automatica
         self.last_label = None
         self.ws = None
         self.vad = None                  # modello silero (lazy)
@@ -278,6 +304,33 @@ async def notify(sess, msg):
         await sess.ws.send_text(json.dumps(msg, ensure_ascii=False))
 
 
+def make_voices_msg(sess):
+    return {"type": "voices", "voices": [
+        {"name": k, "count": v, "pinned": k in sess.pinned}
+        for k, v in sess.voices.items()
+    ]}
+
+
+async def prune_stale(sess):
+    """Rimuove periodicamente le voci che non vengono rilevate da VOICE_TTL_S.
+
+    L'ospite che va via sparisce dal catalogo e dalla lista voci; se rientra
+    dopo il TTL verra' trattato come una nuova voce. Le voci protette (pinned)
+    non vengono mai rimosse. Dopo ogni pulizia aggiorna il client.
+    """
+    try:
+        while True:
+            await asyncio.sleep(PRUNE_INTERVAL_S)
+            removed = sess.catalog.prune(VOICE_TTL_S, sess.pinned)
+            if removed:
+                for k in removed:
+                    sess.voices.pop(k, None)
+                print(f"[prune] rimosse {len(removed)} voci: {removed}", flush=True)
+                await notify(sess, make_voices_msg(sess))
+    except asyncio.CancelledError:
+        pass
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -286,6 +339,16 @@ async def ws_endpoint(ws: WebSocket):
     sess = StreamSession()
     sess.ws = ws
     audio_on = False
+    prune_task = None
+
+    def restart_prune():
+        """(Ri)avvia il task di pulizia sul catalogo corrente della sessione."""
+        nonlocal prune_task
+        if prune_task is not None:
+            prune_task.cancel()
+        prune_task = asyncio.create_task(prune_stale(sess))
+
+    restart_prune()
     await notify(sess, {"type": "status", "text": "backend: pronto"})
     try:
         while True:
@@ -301,6 +364,7 @@ async def ws_endpoint(ws: WebSocket):
                         sess = StreamSession()
                         sess.ws = ws
                         audio_on = False
+                        restart_prune()
                         await notify(sess, {"type": "status", "text": "backend: sessione azzerata"})
                     elif t == "audio":
                         sess.rate = int(data.get("rate", SR))
@@ -312,6 +376,12 @@ async def ws_endpoint(ws: WebSocket):
                         ms = max(32, min(1024, ms // 32 * 32))
                         sess.heartbeat_s = ms / 1000.0
                         sess.last_beat = None
+                    elif t == "pin":
+                        sess.pinned.add(data.get("name"))
+                        await notify(sess, make_voices_msg(sess))
+                    elif t == "unpin":
+                        sess.pinned.discard(data.get("name"))
+                        await notify(sess, make_voices_msg(sess))
                 elif "bytes" in msg and audio_on:
                     for m in await feed_audio(sess, pipe, model, msg["bytes"]):
                         await notify(sess, m)
@@ -323,6 +393,8 @@ async def ws_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        if prune_task is not None:
+            prune_task.cancel()
         sess.ws = None
 
 
@@ -341,13 +413,13 @@ async def handle_utt(sess, pipe, model, utt):
     sess.last_label = label
     sess.beat_label = label
     sess.beat_at = time.monotonic()
-    voices_msg = {"type": "voices", "voices": [{"name": k, "count": v} for k, v in sess.voices.items()]}
+    voices_msg = make_voices_msg(sess)
     if sess.overlap is not None:
         out = [{"type": "overlap", "speakers": list(sess.overlap)}, voices_msg]
         sess.overlap = None
         return out
     sess.voices[label] = sess.voices.get(label, 0) + 1
-    voices_msg = {"type": "voices", "voices": [{"name": k, "count": v} for k, v in sess.voices.items()]}
+    voices_msg = make_voices_msg(sess)
     return [{"type": "now", "speaker": label}, voices_msg]
 
 
